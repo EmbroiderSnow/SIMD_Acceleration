@@ -16,7 +16,7 @@ const int HEIGHT = 1080;
 const int Y_SIZE = WIDTH * HEIGHT;
 const int UV_SIZE = Y_SIZE / 4;
 
-const int REPEAT_COUNT = 20; 
+const int REPEAT_COUNT = 50; 
 
 bool readYUV(const std::string& filename, YUVFrame& frame) {
     std::ifstream file(filename, std::ios::binary);
