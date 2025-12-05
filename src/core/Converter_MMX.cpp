@@ -542,4 +542,210 @@ namespace MMX
         }
         _mm_empty();
     }
+
+    // ---------------------------------------------------------
+    // MemOnly: 保留重叠写入逻辑 (Overlapping Store)
+    // ---------------------------------------------------------
+    void YUV2RGB_RGB888_MemOnly(const YUVFrame &src, RGBFrame &dst)
+    {
+        int width = src.width;
+        int height = src.height;
+        uint8_t *dstPtr = dst.data;
+        const uint8_t *YPtr = src.Y;
+
+        for (int y = 0; y < height; y++)
+        {
+            // 强制读取 UV
+            int uvOffset = (y / 2) * (width / 2);
+            volatile int u_dummy = *(int*)(src.U + uvOffset);
+            volatile int v_dummy = *(int*)(src.V + uvOffset);
+            (void)u_dummy; (void)v_dummy;
+
+            for (int x = 0; x < width; x += 8)
+            {
+                // 1. Load (8 pixels)
+                __m64 y_raw = *(__m64 *)(YPtr + y * width + x);
+                
+                // 2. 构造 Dummy 数据 (模拟 BGRA 结构)
+                // 直接使用 y_raw 填充，不进行计算
+                __m64 BGRA_dummy = y_raw; 
+
+                // 3. Store (完全复刻原版的重叠写入逻辑)
+                uint8_t *ptr = dstPtr + (y * width + x) * 3;
+                int pixels[8];
+                
+                // 模拟解包后的数据分布
+                int val = _mm_cvtsi64_si32(BGRA_dummy);
+                for(int k=0; k<8; ++k) pixels[k] = val;
+
+                // 关键瓶颈点：8 次非对齐的 4 字节写入
+                for (int k = 0; k < 8; ++k)
+                {
+                    *(int *)(ptr + k * 3) = pixels[k];
+                }
+            }
+        }
+        _mm_empty();
+    }
+
+    // ---------------------------------------------------------
+    // ComputeOnly: 保留繁琐的 Unpack 和 pmadd
+    // ---------------------------------------------------------
+    void YUV2RGB_RGB888_ComputeOnly(const YUVFrame &src, RGBFrame &dst)
+    {
+        int width = src.width;
+        int height = src.height;
+        const uint8_t *YPtr = src.Y;
+        const uint8_t *UPtr = src.U;
+        const uint8_t *VPtr = src.V;
+
+        __m64 c90 = _mm_set1_pi16(90);
+        __m64 c22 = _mm_set1_pi16(22);
+        __m64 c46 = _mm_set1_pi16(46);
+        __m64 c113 = _mm_set1_pi16(113);
+        __m64 zero = _mm_setzero_si64();
+        __m64 alphaVec = _mm_set1_pi8(255);
+        
+        // 累加器
+        __m64 accum = _mm_setzero_si64();
+
+        for (int y = 0; y < height; y++)
+        {
+            int uvOffset = (y / 2) * (width / 2);
+            for (int x = 0; x < width; x += 8)
+            {
+                // Load & Upsample Logic... [保持原版逻辑]
+                __m64 y_raw = *(__m64 *)(YPtr + y * width + x);
+                int u_val = *(int *)(UPtr + uvOffset + (x / 2));
+                int v_val = *(int *)(VPtr + uvOffset + (x / 2));
+                __m64 u_raw_4 = _mm_cvtsi32_si64(u_val);
+                __m64 v_raw_4 = _mm_cvtsi32_si64(v_val);
+                __m64 u_raw = _mm_unpacklo_pi8(u_raw_4, u_raw_4);
+                __m64 v_raw = _mm_unpacklo_pi8(v_raw_4, v_raw_4);
+
+                // ... Process Low 4 pixels ...
+                __m64 y_lo = _mm_unpacklo_pi8(y_raw, zero);
+                __m64 u_lo = expand_and_sub128(u_raw, zero, false);
+                __m64 v_lo = expand_and_sub128(v_raw, zero, false);
+
+                __m64 r_lo = _mm_add_pi16(y_lo, _mm_srai_pi16(_mm_mullo_pi16(c90, v_lo), 6));
+                __m64 g_part_lo = _mm_add_pi16(_mm_mullo_pi16(c22, u_lo), _mm_mullo_pi16(c46, v_lo));
+                __m64 g_lo = _mm_sub_pi16(y_lo, _mm_srai_pi16(g_part_lo, 6));
+                __m64 b_lo = _mm_add_pi16(y_lo, _mm_srai_pi16(_mm_mullo_pi16(c113, u_lo), 6));
+
+                // ... Process High 4 pixels ...
+                __m64 y_hi = _mm_unpackhi_pi8(y_raw, zero);
+                __m64 u_hi = expand_and_sub128(u_raw, zero, true);
+                __m64 v_hi = expand_and_sub128(v_raw, zero, true);
+
+                __m64 r_hi = _mm_add_pi16(y_hi, _mm_srai_pi16(_mm_mullo_pi16(c90, v_hi), 6));
+                __m64 g_part_hi = _mm_add_pi16(_mm_mullo_pi16(c22, u_hi), _mm_mullo_pi16(c46, v_hi));
+                __m64 g_hi = _mm_sub_pi16(y_hi, _mm_srai_pi16(g_part_hi, 6));
+                __m64 b_hi = _mm_add_pi16(y_hi, _mm_srai_pi16(_mm_mullo_pi16(c113, u_hi), 6));
+
+                // Pack
+                __m64 R = _mm_packs_pu16(r_lo, r_hi);
+                __m64 G = _mm_packs_pu16(g_lo, g_hi);
+                __m64 B = _mm_packs_pu16(b_lo, b_hi);
+                
+                // 虚假累加，防止优化
+                accum = _mm_xor_si64(accum, R);
+                accum = _mm_xor_si64(accum, G);
+                accum = _mm_xor_si64(accum, B);
+            }
+        }
+        // 防止 accum 被删
+        volatile int keep_alive = _mm_cvtsi64_si32(accum);
+        (void)keep_alive;
+        _mm_empty();
+    }
+
+    // =========================================================
+    // ShuffleOnly: 保留 Unpack/Pack 和 复杂的 Store 逻辑
+    // =========================================================
+    void YUV2RGB_RGB888_ShuffleOnly(const YUVFrame &src, RGBFrame &dst)
+    {
+        int width = src.width;
+        int height = src.height;
+        const uint8_t *YPtr = src.Y;
+        const uint8_t *UPtr = src.U;
+        const uint8_t *VPtr = src.V;
+        uint8_t *dstPtr = dst.data;
+
+        __m64 zero = _mm_setzero_si64();
+        // Alpha 通道填充
+        __m64 alphaVec = _mm_set1_pi8(255);
+
+        for (int y = 0; y < height; y++)
+        {
+            int uvOffset = (y / 2) * (width / 2);
+
+            for (int x = 0; x < width; x += 8)
+            {
+                // 1. Load (Layout)
+                __m64 y_raw = *(__m64 *)(YPtr + y * width + x);
+
+                int u_val = *(int *)(UPtr + uvOffset + (x / 2));
+                int v_val = *(int *)(VPtr + uvOffset + (x / 2));
+                __m64 u_raw_4 = _mm_cvtsi32_si64(u_val);
+                __m64 v_raw_4 = _mm_cvtsi32_si64(v_val);
+                
+                // Upsample (Unpack is Layout)
+                __m64 u_raw = _mm_unpacklo_pi8(u_raw_4, u_raw_4);
+                __m64 v_raw = _mm_unpacklo_pi8(v_raw_4, v_raw_4);
+
+                // 2. Math Removed (Use XOR to simulate dependency)
+                // 用简单的逻辑运算替代繁重的乘加
+                __m64 y_lo = _mm_unpacklo_pi8(y_raw, zero);
+                __m64 y_hi = _mm_unpackhi_pi8(y_raw, zero);
+                
+                __m64 u_lo = _mm_unpacklo_pi8(u_raw, zero); 
+                __m64 u_hi = _mm_unpackhi_pi8(u_raw, zero); // unpackhi 需要重新从寄存器取，算 Layout
+
+                // 模拟结果
+                __m64 r_lo = _mm_xor_si64(y_lo, u_lo);
+                __m64 g_lo = y_lo;
+                __m64 b_lo = u_lo;
+
+                __m64 r_hi = _mm_xor_si64(y_hi, u_hi);
+                __m64 g_hi = y_hi;
+                __m64 b_hi = u_hi;
+
+                // 3. Pack & Interleave (核心 Layout 开销)
+                __m64 R = _mm_packs_pu16(r_lo, r_hi);
+                __m64 G = _mm_packs_pu16(g_lo, g_hi);
+                __m64 B = _mm_packs_pu16(b_lo, b_hi);
+                __m64 A = alphaVec;
+
+                // Planar -> BGRA 
+                __m64 BG_lo = _mm_unpacklo_pi8(B, G);
+                __m64 BG_hi = _mm_unpackhi_pi8(B, G);
+                __m64 RA_lo = _mm_unpacklo_pi8(R, A);
+                __m64 RA_hi = _mm_unpackhi_pi8(R, A);
+
+                __m64 BGRA_0 = _mm_unpacklo_pi16(BG_lo, RA_lo);
+                __m64 BGRA_1 = _mm_unpackhi_pi16(BG_lo, RA_lo);
+                __m64 BGRA_2 = _mm_unpacklo_pi16(BG_hi, RA_hi);
+                __m64 BGRA_3 = _mm_unpackhi_pi16(BG_hi, RA_hi);
+
+                // 4. Store Logic (Layout: Register -> Stack -> Memory)
+                uint8_t *ptr = dstPtr + (y * width + x) * 3;
+                int pixels[8];
+                pixels[0] = _mm_cvtsi64_si32(BGRA_0);
+                pixels[1] = _mm_cvtsi64_si32(_mm_unpackhi_pi32(BGRA_0, BGRA_0));
+                pixels[2] = _mm_cvtsi64_si32(BGRA_1);
+                pixels[3] = _mm_cvtsi64_si32(_mm_unpackhi_pi32(BGRA_1, BGRA_1));
+                pixels[4] = _mm_cvtsi64_si32(BGRA_2);
+                pixels[5] = _mm_cvtsi64_si32(_mm_unpackhi_pi32(BGRA_2, BGRA_2));
+                pixels[6] = _mm_cvtsi64_si32(BGRA_3);
+                pixels[7] = _mm_cvtsi64_si32(_mm_unpackhi_pi32(BGRA_3, BGRA_3));
+
+                for (int k = 0; k < 8; ++k)
+                {
+                    *(int *)(ptr + k * 3) = pixels[k];
+                }
+            }
+        }
+        _mm_empty();
+    }
 }

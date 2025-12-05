@@ -675,4 +675,263 @@ namespace AVX
         }
         _mm256_zeroupper();
     }
+
+    // ---------------------------------------------------------
+    // MemOnly: 模拟 Shuffle 后的 12字节 (8+4) 块写入
+    // ---------------------------------------------------------
+    void YUV2RGB_RGB888_MemOnly(const YUVFrame &src, RGBFrame &dst)
+    {
+        int width = src.width;
+        int height = src.height;
+        uint8_t *dstPtr = dst.data;
+        const uint8_t *YPtr = src.Y;
+
+        for (int y = 0; y < height; y++)
+        {
+            int uvOffset = (y / 2) * (width / 2);
+            // Force read UV
+            volatile __m128i u_v = _mm_loadu_si128((const __m128i*)(src.U + uvOffset));
+            (void)u_v;
+
+            for (int x = 0; x < width; x += 32)
+            {
+                // 1. Load Y
+                __m256i y_raw = _mm256_loadu_si256((const __m256i *)(YPtr + y * width + x));
+
+                // 2. Dummy Compute Result (模拟四个 Lane 的结果)
+                // 原版代码中，s0, s1, s2, s3 已经是 Shuffle 好的数据
+                __m256i s_dummy = y_raw; 
+
+                uint8_t* p = dstPtr + (y * width + x) * 3;
+
+                // 3. Store Lambda (复刻原版)
+                auto store_lane_12bytes = [&](__m128i lane_data) {
+                    _mm_storel_epi64((__m128i*)p, lane_data);
+                    *(int*)(p + 8) = _mm_cvtsi128_si32(_mm_srli_si128(lane_data, 8));
+                    p += 12; 
+                };
+
+                // 执行存储模式
+                // Lane 0 & 1
+                store_lane_12bytes(_mm256_castsi256_si128(s_dummy));
+                store_lane_12bytes(_mm256_extracti128_si256(s_dummy, 1));
+                
+                // 模拟后续 Lane (虽然数据一样，但 Store 指令流是一样的)
+                store_lane_12bytes(_mm256_castsi256_si128(s_dummy));
+                store_lane_12bytes(_mm256_extracti128_si256(s_dummy, 1));
+
+                store_lane_12bytes(_mm256_castsi256_si128(s_dummy));
+                store_lane_12bytes(_mm256_extracti128_si256(s_dummy, 1));
+
+                store_lane_12bytes(_mm256_castsi256_si128(s_dummy));
+                store_lane_12bytes(_mm256_extracti128_si256(s_dummy, 1));
+            }
+        }
+    }
+
+    // ---------------------------------------------------------
+    // ComputeOnly: 包含所有 Permute 和 Shuffle
+    // ---------------------------------------------------------
+    void YUV2RGB_RGB888_ComputeOnly(const YUVFrame &src, RGBFrame &dst)
+    {
+        int width = src.width;
+        int height = src.height;
+        const uint8_t *YPtr = src.Y;
+        const uint8_t *UPtr = src.U;
+        const uint8_t *VPtr = src.V;
+
+        __m256i c90  = _mm256_set1_epi16(90);
+        __m256i c22  = _mm256_set1_epi16(22);
+        __m256i c46  = _mm256_set1_epi16(46);
+        __m256i c113 = _mm256_set1_epi16(113);
+        __m256i c128 = _mm256_set1_epi16(128);
+        __m256i zero = _mm256_setzero_si256();
+        __m256i alphaVec = zero; 
+        
+        // Critical Shuffle Mask
+        __m256i shuffleMask = _mm256_setr_epi8(
+            0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, -1, -1, -1, -1,
+            0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, -1, -1, -1, -1 
+        );
+
+        __m256i accum = zero;
+
+        for (int y = 0; y < height; y++)
+        {
+            int uvOffset = (y / 2) * (width / 2);
+
+            for (int x = 0; x < width; x += 32)
+            {
+                // ... Load & Upsample ...
+                __m256i y_raw = _mm256_loadu_si256((const __m256i *)(YPtr + y * width + x));
+                __m128i u_small = _mm_loadu_si128((const __m128i *)(UPtr + uvOffset + (x / 2)));
+                __m128i v_small = _mm_loadu_si128((const __m128i *)(VPtr + uvOffset + (x / 2)));
+
+                __m128i u_lo_128 = _mm_unpacklo_epi8(u_small, u_small); 
+                __m128i u_hi_128 = _mm_unpackhi_epi8(u_small, u_small);
+                __m256i u_raw = _mm256_inserti128_si256(_mm256_castsi128_si256(u_lo_128), u_hi_128, 1);
+
+                __m128i v_lo_128 = _mm_unpacklo_epi8(v_small, v_small);
+                __m128i v_hi_128 = _mm_unpackhi_epi8(v_small, v_small);
+                __m256i v_raw = _mm256_inserti128_si256(_mm256_castsi128_si256(v_lo_128), v_hi_128, 1);
+
+                // ... Calc ...
+                __m256i y0 = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(y_raw));
+                __m256i u0 = _mm256_sub_epi16(_mm256_cvtepu8_epi16(_mm256_castsi256_si128(u_raw)), c128);
+                __m256i v0 = _mm256_sub_epi16(_mm256_cvtepu8_epi16(_mm256_castsi256_si128(v_raw)), c128);
+
+                __m256i y1 = _mm256_cvtepu8_epi16(_mm256_extracti128_si256(y_raw, 1));
+                __m256i u1 = _mm256_sub_epi16(_mm256_cvtepu8_epi16(_mm256_extracti128_si256(u_raw, 1)), c128);
+                __m256i v1 = _mm256_sub_epi16(_mm256_cvtepu8_epi16(_mm256_extracti128_si256(v_raw, 1)), c128);
+
+                __m256i r0 = _mm256_add_epi16(y0, _mm256_srai_epi16(_mm256_mullo_epi16(c90, v0), 6));
+                __m256i g_part0 = _mm256_add_epi16(_mm256_mullo_epi16(c22, u0), _mm256_mullo_epi16(c46, v0));
+                __m256i g0 = _mm256_sub_epi16(y0, _mm256_srai_epi16(g_part0, 6));
+                __m256i b0 = _mm256_add_epi16(y0, _mm256_srai_epi16(_mm256_mullo_epi16(c113, u0), 6));
+
+                __m256i r1 = _mm256_add_epi16(y1, _mm256_srai_epi16(_mm256_mullo_epi16(c90, v1), 6));
+                __m256i g_part1 = _mm256_add_epi16(_mm256_mullo_epi16(c22, u1), _mm256_mullo_epi16(c46, v1));
+                __m256i g1 = _mm256_sub_epi16(y1, _mm256_srai_epi16(g_part1, 6));
+                __m256i b1 = _mm256_add_epi16(y1, _mm256_srai_epi16(_mm256_mullo_epi16(c113, u1), 6));
+
+                // ... Pack & Permute ...
+                __m256i R = _mm256_packus_epi16(r0, r1);
+                __m256i G = _mm256_packus_epi16(g0, g1);
+                __m256i B = _mm256_packus_epi16(b0, b1);
+                __m256i A = alphaVec;
+
+                R = _mm256_permute4x64_epi64(R, 0xD8);
+                G = _mm256_permute4x64_epi64(G, 0xD8);
+                B = _mm256_permute4x64_epi64(B, 0xD8);
+
+                __m256i bg_lo = _mm256_unpacklo_epi8(B, G);
+                __m256i bg_hi = _mm256_unpackhi_epi8(B, G);
+                __m256i ra_lo = _mm256_unpacklo_epi8(R, A);
+                __m256i ra_hi = _mm256_unpackhi_epi8(R, A);
+
+                __m256i res0 = _mm256_unpacklo_epi16(bg_lo, ra_lo);
+                __m256i res1 = _mm256_unpackhi_epi16(bg_lo, ra_lo);
+                __m256i res2 = _mm256_unpacklo_epi16(bg_hi, ra_hi);
+                __m256i res3 = _mm256_unpackhi_epi16(bg_hi, ra_hi);
+
+                __m256i out0 = _mm256_permute2x128_si256(res0, res1, 0x20);
+                __m256i out1 = _mm256_permute2x128_si256(res2, res3, 0x20);
+                __m256i out2 = _mm256_permute2x128_si256(res0, res1, 0x31);
+                __m256i out3 = _mm256_permute2x128_si256(res2, res3, 0x31);
+
+                // ... Final Shuffle (Important part of compute) ...
+                __m256i s0 = _mm256_shuffle_epi8(out0, shuffleMask);
+                __m256i s1 = _mm256_shuffle_epi8(out1, shuffleMask);
+                __m256i s2 = _mm256_shuffle_epi8(out2, shuffleMask);
+                __m256i s3 = _mm256_shuffle_epi8(out3, shuffleMask);
+
+                // 虚假累加
+                accum = _mm256_xor_si256(accum, s0);
+                accum = _mm256_xor_si256(accum, s1);
+                accum = _mm256_xor_si256(accum, s2);
+                accum = _mm256_xor_si256(accum, s3);
+            }
+        }
+        volatile int keep_alive = _mm256_extract_epi32(accum, 0);
+        (void)keep_alive;
+        _mm256_zeroupper();
+    }
+
+    // =========================================================
+    // Analysis: Shuffle/Layout Overhead Test
+    // 目的：测量数据重排（Permute/Shuffle/Pack）的开销
+    // =========================================================
+    void YUV2RGB_RGB888_ShuffleOnly(const YUVFrame &src, RGBFrame &dst)
+    {
+        int width = src.width;
+        int height = src.height;
+        const uint8_t *YPtr = src.Y;
+        const uint8_t *UPtr = src.U;
+        const uint8_t *VPtr = src.V;
+
+        __m256i zero = _mm256_setzero_si256();
+        // 只有 Shuffle Mask 是必须的，数学常数都不需要了
+        __m256i shuffleMask = _mm256_setr_epi8(
+            0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, -1, -1, -1, -1,
+            0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, -1, -1, -1, -1 
+        );
+
+        __m256i accum = zero;
+
+        for (int y = 0; y < height; y++)
+        {
+            int uvOffset = (y / 2) * (width / 2);
+            for (int x = 0; x < width; x += 32)
+            {
+                // 1. Load & Upsample (属于 Layout 操作)
+                __m256i y_raw = _mm256_loadu_si256((const __m256i *)(YPtr + y * width + x));
+                
+                __m128i u_small = _mm_loadu_si128((const __m128i *)(UPtr + uvOffset + (x / 2)));
+                __m128i v_small = _mm_loadu_si128((const __m128i *)(VPtr + uvOffset + (x / 2)));
+
+                // UV Upsample (Unpack + Insert)
+                __m128i u_lo_128 = _mm_unpacklo_epi8(u_small, u_small); 
+                __m128i u_hi_128 = _mm_unpackhi_epi8(u_small, u_small);
+                __m256i u_raw = _mm256_inserti128_si256(_mm256_castsi128_si256(u_lo_128), u_hi_128, 1);
+
+                __m128i v_lo_128 = _mm_unpacklo_epi8(v_small, v_small);
+                __m128i v_hi_128 = _mm_unpackhi_epi8(v_small, v_small);
+                __m256i v_raw = _mm256_inserti128_si256(_mm256_castsi128_si256(v_lo_128), v_hi_128, 1);
+
+                // 2. Math Removed (跳过 Convert/Sub/Mul/Add)
+                // 直接把 Y/U/V 当作计算结果，模拟数据流
+                // 为了模拟数据依赖链，我们做简单的 XOR 混合，延迟极低
+                __m256i r0 = y_raw;
+                __m256i g0 = _mm256_xor_si256(y_raw, u_raw);
+                __m256i b0 = v_raw;
+                
+                // 模拟两个 Batch 的结果 (r1/g1/b1)
+                __m256i r1 = r0;
+                __m256i g1 = g0;
+                __m256i b1 = b0;
+
+                // 3. Pack & Permute & Interleave (核心 Layout 开销)
+                // Pack 16->8
+                __m256i R = _mm256_packus_epi16(r0, r1);
+                __m256i G = _mm256_packus_epi16(g0, g1);
+                __m256i B = _mm256_packus_epi16(b0, b1);
+                __m256i A = zero; // Alpha
+
+                // Permute (跨 Lane 修正)
+                R = _mm256_permute4x64_epi64(R, 0xD8);
+                G = _mm256_permute4x64_epi64(G, 0xD8);
+                B = _mm256_permute4x64_epi64(B, 0xD8);
+
+                // Interleave (Unpack)
+                __m256i bg_lo = _mm256_unpacklo_epi8(B, G);
+                __m256i bg_hi = _mm256_unpackhi_epi8(B, G);
+                __m256i ra_lo = _mm256_unpacklo_epi8(R, A);
+                __m256i ra_hi = _mm256_unpackhi_epi8(R, A);
+
+                __m256i res0 = _mm256_unpacklo_epi16(bg_lo, ra_lo);
+                __m256i res1 = _mm256_unpackhi_epi16(bg_lo, ra_lo);
+                __m256i res2 = _mm256_unpacklo_epi16(bg_hi, ra_hi);
+                __m256i res3 = _mm256_unpackhi_epi16(bg_hi, ra_hi);
+
+                // Permute2x128 (跨 128-bit Lane 重组)
+                __m256i out0 = _mm256_permute2x128_si256(res0, res1, 0x20);
+                __m256i out1 = _mm256_permute2x128_si256(res2, res3, 0x20);
+                __m256i out2 = _mm256_permute2x128_si256(res0, res1, 0x31);
+                __m256i out3 = _mm256_permute2x128_si256(res2, res3, 0x31);
+
+                // Shuffle (Final Compression to RGB)
+                __m256i s0 = _mm256_shuffle_epi8(out0, shuffleMask);
+                __m256i s1 = _mm256_shuffle_epi8(out1, shuffleMask);
+                __m256i s2 = _mm256_shuffle_epi8(out2, shuffleMask);
+                __m256i s3 = _mm256_shuffle_epi8(out3, shuffleMask);
+
+                // 4. Accumulate (No Store)
+                accum = _mm256_xor_si256(accum, s0);
+                accum = _mm256_xor_si256(accum, s1);
+                accum = _mm256_xor_si256(accum, s2);
+                accum = _mm256_xor_si256(accum, s3);
+            }
+        }
+        volatile int keep = _mm256_extract_epi32(accum, 0); (void)keep;
+    }
 }

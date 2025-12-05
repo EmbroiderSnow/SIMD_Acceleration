@@ -565,4 +565,198 @@ namespace SSE
             }
         }
     }
+
+    // ---------------------------------------------------------
+    // MemOnly: 模拟 Stack Buffer 中转 + 重叠写入
+    // ---------------------------------------------------------
+    void YUV2RGB_RGB888_MemOnly(const YUVFrame &src, RGBFrame &dst)
+    {
+        int width = src.width;
+        int height = src.height;
+        uint8_t *dstPtr = dst.data;
+        const uint8_t *YPtr = src.Y;
+
+        for (int y = 0; y < height; y++)
+        {
+            int uvOffset = (y / 2) * (width / 2);
+            volatile long long u_dummy = *(long long*)(src.U + uvOffset); // force read
+            (void)u_dummy; 
+
+            for (int x = 0; x < width; x += 16)
+            {
+                // 1. Load Y
+                __m128i y_raw = _mm_loadu_si128((const __m128i *)(YPtr + y * width + x));
+
+                // 2. 构造 Dummy 结果 (模拟 unpack/pack 后的结果)
+                __m128i res_dummy = y_raw; 
+
+                // 3. Buffer on Stack (复刻原版逻辑)
+                uint32_t buffer[16]; 
+                _mm_storeu_si128((__m128i*)&buffer[0], res_dummy);
+                _mm_storeu_si128((__m128i*)&buffer[4], res_dummy);
+                _mm_storeu_si128((__m128i*)&buffer[8], res_dummy);
+                _mm_storeu_si128((__m128i*)&buffer[12], res_dummy);
+
+                // 4. Overlap-write (瓶颈所在)
+                uint8_t *ptr = dstPtr + (y * width + x) * 3;
+                for (int k = 0; k < 16; ++k) {
+                    *(uint32_t*)(ptr + k * 3) = buffer[k];
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------
+    // ComputeOnly: 主要是 16-bit 运算
+    // ---------------------------------------------------------
+    void YUV2RGB_RGB888_ComputeOnly(const YUVFrame &src, RGBFrame &dst)
+    {
+        int width = src.width;
+        int height = src.height;
+        const uint8_t *YPtr = src.Y;
+        const uint8_t *UPtr = src.U;
+        const uint8_t *VPtr = src.V;
+
+        __m128i c90 = _mm_set1_epi16(90);
+        __m128i c22 = _mm_set1_epi16(22);
+        __m128i c46 = _mm_set1_epi16(46);
+        __m128i c113 = _mm_set1_epi16(113);
+        __m128i zero = _mm_setzero_si128();
+        __m128i c128 = _mm_set1_epi16(128);
+        __m128i alphaVec = _mm_setzero_si128();
+
+        __m128i accum = _mm_setzero_si128();
+
+        for (int y = 0; y < height; y++)
+        {
+            int uvOffset = (y / 2) * (width / 2);
+            for (int x = 0; x < width; x += 16)
+            {
+                // Load & Compute Logic ... [保持原版]
+                __m128i y_raw = _mm_loadu_si128((const __m128i *)(YPtr + y * width + x));
+                __m128i u_raw_8 = _mm_loadl_epi64((const __m128i *)(UPtr + uvOffset + (x / 2)));
+                __m128i v_raw_8 = _mm_loadl_epi64((const __m128i *)(VPtr + uvOffset + (x / 2)));
+
+                __m128i u_raw = _mm_unpacklo_epi8(u_raw_8, u_raw_8);
+                __m128i v_raw = _mm_unpacklo_epi8(v_raw_8, v_raw_8);
+
+                __m128i y_lo = _mm_unpacklo_epi8(y_raw, zero);
+                __m128i y_hi = _mm_unpackhi_epi8(y_raw, zero);
+                __m128i u_lo = _mm_sub_epi16(_mm_unpacklo_epi8(u_raw, zero), c128);
+                __m128i u_hi = _mm_sub_epi16(_mm_unpackhi_epi8(u_raw, zero), c128);
+                __m128i v_lo = _mm_sub_epi16(_mm_unpacklo_epi8(v_raw, zero), c128);
+                __m128i v_hi = _mm_sub_epi16(_mm_unpackhi_epi8(v_raw, zero), c128);
+
+                __m128i r_lo = _mm_add_epi16(y_lo, _mm_srai_epi16(_mm_mullo_epi16(c90, v_lo), 6));
+                __m128i r_hi = _mm_add_epi16(y_hi, _mm_srai_epi16(_mm_mullo_epi16(c90, v_hi), 6));
+                __m128i b_lo = _mm_add_epi16(y_lo, _mm_srai_epi16(_mm_mullo_epi16(c113, u_lo), 6));
+                __m128i b_hi = _mm_add_epi16(y_hi, _mm_srai_epi16(_mm_mullo_epi16(c113, u_hi), 6));
+
+                __m128i g_part_lo = _mm_add_epi16(_mm_mullo_epi16(c22, u_lo), _mm_mullo_epi16(c46, v_lo));
+                __m128i g_part_hi = _mm_add_epi16(_mm_mullo_epi16(c22, u_hi), _mm_mullo_epi16(c46, v_hi));
+                __m128i g_lo = _mm_sub_epi16(y_lo, _mm_srai_epi16(g_part_lo, 6));
+                __m128i g_hi = _mm_sub_epi16(y_hi, _mm_srai_epi16(g_part_hi, 6));
+
+                __m128i R = _mm_packus_epi16(r_lo, r_hi);
+                __m128i G = _mm_packus_epi16(g_lo, g_hi);
+                __m128i B = _mm_packus_epi16(b_lo, b_hi);
+                __m128i A = alphaVec;
+
+                // Interleave 
+                __m128i BG_lo = _mm_unpacklo_epi8(B, G);
+                __m128i BG_hi = _mm_unpackhi_epi8(B, G);
+                __m128i RA_lo = _mm_unpacklo_epi8(R, A);
+                __m128i RA_hi = _mm_unpackhi_epi8(R, A);
+
+                __m128i res0 = _mm_unpacklo_epi16(BG_lo, RA_lo);
+                __m128i res1 = _mm_unpackhi_epi16(BG_lo, RA_lo);
+                __m128i res2 = _mm_unpacklo_epi16(BG_hi, RA_hi);
+                __m128i res3 = _mm_unpackhi_epi16(BG_hi, RA_hi);
+
+                // 虚假累加
+                accum = _mm_xor_si128(accum, res0);
+                accum = _mm_xor_si128(accum, res1);
+                accum = _mm_xor_si128(accum, res2);
+                accum = _mm_xor_si128(accum, res3);
+            }
+        }
+        volatile int keep_alive = _mm_cvtsi128_si32(accum);
+        (void)keep_alive;
+    }
+
+    // =========================================================
+    // ShuffleOnly: 保留 Interleave 和 Stack Buffer Store
+    // =========================================================
+    void YUV2RGB_RGB888_ShuffleOnly(const YUVFrame &src, RGBFrame &dst)
+    {
+        int width = src.width;
+        int height = src.height;
+        const uint8_t *YPtr = src.Y;
+        const uint8_t *UPtr = src.U;
+        const uint8_t *VPtr = src.V;
+        uint8_t *dstPtr = dst.data;
+
+        __m128i zero = _mm_setzero_si128();
+        __m128i alphaVec = zero;
+
+        for (int y = 0; y < height; y++)
+        {
+            int uvOffset = (y / 2) * (width / 2);
+
+            for (int x = 0; x < width; x += 16)
+            {
+                // 1. Load & Upsample (Layout)
+                __m128i y_raw = _mm_loadu_si128((const __m128i *)(YPtr + y * width + x));
+                __m128i u_raw_8 = _mm_loadl_epi64((const __m128i *)(UPtr + uvOffset + (x / 2)));
+                __m128i v_raw_8 = _mm_loadl_epi64((const __m128i *)(VPtr + uvOffset + (x / 2)));
+
+                __m128i u_raw = _mm_unpacklo_epi8(u_raw_8, u_raw_8);
+                __m128i v_raw = _mm_unpacklo_epi8(v_raw_8, v_raw_8);
+
+                // 2. Math Removed (Simulate dependency)
+                // 仅 unpack，不进行 calculate
+                __m128i y_lo = _mm_unpacklo_epi8(y_raw, zero);
+                __m128i y_hi = _mm_unpackhi_epi8(y_raw, zero);
+                __m128i u_lo = _mm_unpacklo_epi8(u_raw, zero);
+                __m128i u_hi = _mm_unpackhi_epi8(u_raw, zero);
+
+                // 模拟结果
+                __m128i r_lo = _mm_or_si128(y_lo, u_lo);
+                __m128i r_hi = _mm_or_si128(y_hi, u_hi);
+                __m128i g_lo = y_lo;
+                __m128i g_hi = y_hi;
+                __m128i b_lo = u_lo;
+                __m128i b_hi = u_hi;
+
+                // 3. Pack & Interleave (Layout)
+                __m128i R = _mm_packus_epi16(r_lo, r_hi);
+                __m128i G = _mm_packus_epi16(g_lo, g_hi);
+                __m128i B = _mm_packus_epi16(b_lo, b_hi);
+                __m128i A = alphaVec;
+
+                // Planar -> BGRA Interleaving
+                __m128i BG_lo = _mm_unpacklo_epi8(B, G);
+                __m128i BG_hi = _mm_unpackhi_epi8(B, G);
+                __m128i RA_lo = _mm_unpacklo_epi8(R, A);
+                __m128i RA_hi = _mm_unpackhi_epi8(R, A);
+
+                __m128i res0 = _mm_unpacklo_epi16(BG_lo, RA_lo);
+                __m128i res1 = _mm_unpackhi_epi16(BG_lo, RA_lo);
+                __m128i res2 = _mm_unpacklo_epi16(BG_hi, RA_hi);
+                __m128i res3 = _mm_unpackhi_epi16(BG_hi, RA_hi);
+
+                // 4. Store Logic (Layout: Reg -> Stack -> Mem)
+                uint32_t buffer[16]; 
+                _mm_storeu_si128((__m128i*)&buffer[0], res0);
+                _mm_storeu_si128((__m128i*)&buffer[4], res1);
+                _mm_storeu_si128((__m128i*)&buffer[8], res2);
+                _mm_storeu_si128((__m128i*)&buffer[12], res3);
+
+                uint8_t *ptr = dstPtr + (y * width + x) * 3;
+                for (int k = 0; k < 16; ++k) {
+                    *(uint32_t*)(ptr + k * 3) = buffer[k];
+                }
+            }
+        }
+    }
 }
