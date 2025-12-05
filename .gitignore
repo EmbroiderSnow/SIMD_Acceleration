@@ -1,1 +1,5 @@
 .vscode/
+build/
+output/
+data/
+Makefile
