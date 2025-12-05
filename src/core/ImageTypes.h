@@ -43,7 +43,7 @@ struct RGBFrame
     RGBFrame(int w, int h, RGBFormat format) : width(w), height(h)
     {
         channels = static_cast<int>(format);
-        data = AlignedAllocator<uint8_t>::alloc(w * h * channels);
+        data = AlignedAllocator<uint8_t>::alloc(w * h * channels + 16);
     }
 
     ~RGBFrame()
